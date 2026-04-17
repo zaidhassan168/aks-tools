@@ -28,7 +28,7 @@ Each cluster gets its own `kit-<sub>-<cluster>` kube context — dev/stg/prod cr
 ### Homebrew (recommended on macOS)
 
 ```bash
-brew install zaidhassan168/kit/kit
+brew install zaidhassan168/aks-tools/kit
 ```
 
 ### One-line installer (curl)
