@@ -216,7 +216,8 @@ cmd_pods() {
 
 cmd_logs() {
   local ns="$1"
-  local pod; pod="$(pick_pod "$ns")"
+  local pod; pod="$(pick_pod "$ns")" || return 1
+  [[ -n "$pod" ]] || return 1
   local tail="${2:-200}"
   {
     echo "=== Logs for $pod (tail $tail) ==="
@@ -226,14 +227,16 @@ cmd_logs() {
 
 cmd_logs_follow() {
   local ns="$1"
-  local pod; pod="$(pick_pod "$ns")"
+  local pod; pod="$(pick_pod "$ns")" || return 1
+  [[ -n "$pod" ]] || return 1
   echo "=== Following logs for $pod (Ctrl+C to stop) ==="
   $KUBECTL --context "$KUBE_CTX" -n "$ns" logs "$pod" -f --all-containers=true || true
 }
 
 cmd_describe() {
   local ns="$1"
-  local pod; pod="$(pick_pod "$ns")"
+  local pod; pod="$(pick_pod "$ns")" || return 1
+  [[ -n "$pod" ]] || return 1
   $KUBECTL --context "$KUBE_CTX" -n "$ns" describe pod "$pod" | pager
 }
 
@@ -247,7 +250,8 @@ cmd_events() {
 
 cmd_cm_view() {
   local ns="$1"
-  local cm; cm="$(pick_configmap "$ns")"
+  local cm; cm="$(pick_configmap "$ns")" || return 1
+  [[ -n "$cm" ]] || return 1
   {
     echo "=== ConfigMap: $cm ==="
     $KUBECTL --context "$KUBE_CTX" -n "$ns" get cm "$cm" -o yaml
@@ -256,7 +260,8 @@ cmd_cm_view() {
 
 cmd_cm_get() {
   local ns="$1"
-  local cm; cm="$(pick_configmap "$ns")"
+  local cm; cm="$(pick_configmap "$ns")" || return 1
+  [[ -n "$cm" ]] || return 1
   {
     echo "=== ConfigMap: $cm (data only) ==="
     $KUBECTL --context "$KUBE_CTX" -n "$ns" get cm "$cm" -o jsonpath='{.data}' \
@@ -270,7 +275,8 @@ cmd_cm_get() {
 
 cmd_cm_set() {
   local ns="$1"
-  local cm; cm="$(pick_configmap "$ns")"
+  local cm; cm="$(pick_configmap "$ns")" || return 1
+  [[ -n "$cm" ]] || return 1
   echo "Set configmap values (KEY=VALUE). Empty line to finish."
   local patch_data="{" first=1
   while true; do
@@ -297,7 +303,8 @@ cmd_cm_set() {
 
 cmd_cm_del() {
   local ns="$1"
-  local cm; cm="$(pick_configmap "$ns")"
+  local cm; cm="$(pick_configmap "$ns")" || return 1
+  [[ -n "$cm" ]] || return 1
   echo "Current keys in $cm:"
   local keys=()
   while IFS= read -r k; do [[ -n "$k" ]] && keys+=("$k"); done <<EOF
@@ -323,7 +330,8 @@ EOF
 
 cmd_restart() {
   local ns="$1"
-  local deploy; deploy="$(pick_deployment "$ns")"
+  local deploy; deploy="$(pick_deployment "$ns")" || return 1
+  [[ -n "$deploy" ]] || return 1
   echo "Restarting deployment $deploy..."
   $KUBECTL --context "$KUBE_CTX" -n "$ns" rollout restart deployment "$deploy"
   echo "Watching rollout..."
@@ -332,7 +340,8 @@ cmd_restart() {
 
 cmd_exec() {
   local ns="$1"
-  local pod; pod="$(pick_pod "$ns")"
+  local pod; pod="$(pick_pod "$ns")" || return 1
+  [[ -n "$pod" ]] || return 1
   echo "Opening shell in $pod (Ctrl+D to exit)..."
   $KUBECTL --context "$KUBE_CTX" -n "$ns" exec -it "$pod" -- /bin/sh -c 'command -v bash >/dev/null && exec bash || exec sh' || true
 }
