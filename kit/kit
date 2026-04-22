@@ -704,7 +704,8 @@ print(",".join(f"{k}={v}" for k, v in ml.items()))
   echo "Scanning deployment '$deploy' in '$ns' (selector: $selector)..." >&2
 
   local pods_json
-  pods_json="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get pods -l "$selector" -o json 2>/dev/null || echo '{"items":[]}')"
+  pods_json="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get pods -l "$selector" -o json 2>/dev/null || true)"
+  [[ -z "$pods_json" ]] && pods_json='{"items":[]}'
 
   local stale_tsv
   stale_tsv="$(printf '%s' "$pods_json" | python3 - <<'PY'
@@ -724,7 +725,10 @@ def age_str(td):
     if s < 86400: return f"{s//3600}h"
     return f"{s//86400}d"
 
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = {}
 now = datetime.now(timezone.utc)
 rows = []
 for p in data.get("items", []):
