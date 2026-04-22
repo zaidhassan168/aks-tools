@@ -673,6 +673,160 @@ cmd_orphan_clean() {
   fi
 }
 
+# ---------- Stale pod scan ----------
+
+# Pick a deployment, then list its stale pods (Succeeded / Failed / Evicted /
+# stuck Terminating) in a multi-select picker, confirm, and delete only the
+# chosen ones. Scoping is by deployment, not by whole namespace, so you won't
+# accidentally touch pods from other apps sharing the namespace.
+cmd_stale() {
+  local ns="$1"
+  local deploy; deploy="$(pick_deployment "$ns")" || return 1
+  [[ -n "$deploy" ]] || return 1
+
+  local selector
+  selector="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get deployment "$deploy" -o json 2>/dev/null \
+    | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+ml = (d.get("spec", {}) or {}).get("selector", {}).get("matchLabels", {}) or {}
+print(",".join(f"{k}={v}" for k, v in ml.items()))
+')"
+
+  if [[ -z "$selector" ]]; then
+    echo "Could not read selector labels from deployment '$deploy'." >&2
+    return 1
+  fi
+
+  echo "Scanning deployment '$deploy' in '$ns' (selector: $selector)..." >&2
+
+  local pods_json
+  pods_json="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get pods -l "$selector" -o json 2>/dev/null || echo '{"items":[]}')"
+
+  local stale_tsv
+  stale_tsv="$(printf '%s' "$pods_json" | python3 - <<'PY'
+import sys, json
+from datetime import datetime, timezone
+
+STUCK_TERMINATING_MIN = 5
+
+def parse_ts(s):
+    if not s: return None
+    return datetime.fromisoformat(s.replace('Z', '+00:00'))
+
+def age_str(td):
+    s = int(td.total_seconds())
+    if s < 60: return f"{s}s"
+    if s < 3600: return f"{s//60}m"
+    if s < 86400: return f"{s//3600}h"
+    return f"{s//86400}d"
+
+data = json.load(sys.stdin)
+now = datetime.now(timezone.utc)
+rows = []
+for p in data.get("items", []):
+    meta = p.get("metadata", {})
+    status = p.get("status", {})
+    name = meta.get("name", "")
+    ns = meta.get("namespace", "")
+    phase = status.get("phase", "")
+    reason = status.get("reason", "")
+    created = parse_ts(meta.get("creationTimestamp"))
+    deleted = parse_ts(meta.get("deletionTimestamp"))
+    owners = meta.get("ownerReferences") or []
+    owned_by_job = any(o.get("kind") == "Job" for o in owners)
+
+    flag = None
+    if reason == "Evicted":
+        flag = "Evicted"
+    elif phase == "Failed":
+        flag = f"Failed({reason})" if reason else "Failed"
+    elif phase == "Succeeded" and not owned_by_job:
+        flag = "Succeeded"
+    elif deleted and (now - deleted).total_seconds() > STUCK_TERMINATING_MIN * 60:
+        flag = f"Terminating>{STUCK_TERMINATING_MIN}m"
+
+    if flag:
+        age = age_str(now - created) if created else "?"
+        rows.append("\t".join([ns, name, phase or "-", age, flag]))
+
+print("\n".join(rows))
+PY
+)"
+
+  if [[ -z "$stale_tsv" ]]; then
+    echo "No stale pods found." >&2
+    return 0
+  fi
+
+  local header
+  header=$'NAMESPACE\tPOD\tSTATUS\tAGE\tREASON'
+
+  local selected=""
+  if has_fzf; then
+    selected="$({ printf '%s\n' "$header"; printf '%s\n' "$stale_tsv"; } \
+      | column -t -s $'\t' \
+      | fzf --multi --header-lines=1 \
+            --prompt="Stale pods (Tab to mark, Enter to confirm) > " \
+            --height=70% --reverse)"
+  else
+    local lines=()
+    while IFS= read -r line; do [[ -n "$line" ]] && lines+=("$line"); done <<EOF
+$stale_tsv
+EOF
+    echo "Stale pods:" >&2
+    {
+      printf '  #\t%s\n' "$header"
+      for i in "${!lines[@]}"; do printf '%3d\t%s\n' "$((i+1))" "${lines[$i]}"; done
+    } | column -t -s $'\t' >&2
+    echo >&2
+    read -rp "Select numbers to delete (comma-separated, e.g. 1,3,5; empty to cancel) > " picks
+    [[ -z "$picks" ]] && { echo "Cancelled." >&2; return 0; }
+    IFS=',' read -ra nums <<< "$picks"
+    for n in "${nums[@]}"; do
+      n="$(echo "$n" | tr -d ' ')"
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#lines[@]} )) && selected+="${lines[$((n-1))]}"$'\n'
+    done
+  fi
+
+  [[ -z "$selected" ]] && { echo "No pods selected." >&2; return 0; }
+
+  # Parse back: first whitespace-separated field is namespace, second is pod name.
+  # (column -t pads with spaces; neither ns nor pod names contain whitespace.)
+  local to_delete=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local ns_col pod_col
+    ns_col="$(echo "$line" | awk '{print $1}')"
+    pod_col="$(echo "$line" | awk '{print $2}')"
+    [[ -n "$ns_col" && -n "$pod_col" ]] && to_delete+=("$ns_col|$pod_col")
+  done <<EOF
+$selected
+EOF
+
+  ((${#to_delete[@]})) || { echo "No pods selected." >&2; return 0; }
+
+  echo
+  echo "Will delete ${#to_delete[@]} pod(s):"
+  local entry
+  for entry in "${to_delete[@]}"; do
+    echo "  - ${entry##*|} (ns: ${entry%%|*})"
+  done
+  read -rp "Confirm? (y/n) > " confirm
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "Cancelled."; return 0; }
+
+  for entry in "${to_delete[@]}"; do
+    local ns_p="${entry%%|*}" pod_p="${entry##*|}"
+    echo "Deleting $pod_p (ns: $ns_p)..."
+    $KUBECTL --context "$KUBE_CTX" -n "$ns_p" delete pod "$pod_p" --wait=false >/dev/null 2>&1 \
+      || echo "  Failed to delete $pod_p" >&2
+  done
+  echo "Done."
+}
+
 # ---------- Action menu ----------
 
 pick_action() {
@@ -689,6 +843,7 @@ pick_action() {
     "cm-set       — Add/update configmap values"
     "cm-del       — Delete a configmap key"
     "restart      — Restart a deployment"
+    "stale        — Pick deployment, list its stale pods, delete selected"
     "back-ns      — Change namespace"
     "back-cluster — Change cluster"
     "back-sub     — Change subscription"
@@ -722,6 +877,7 @@ run_action() {
     cm-set)       cmd_cm_set "$ns" ;;
     cm-del)       cmd_cm_del "$ns" ;;
     restart)      cmd_restart "$ns" ;;
+    stale)        cmd_stale "$ns" ;;
     *)            echo "Unknown action: $action" >&2; return 1 ;;
   esac
 }
@@ -752,6 +908,14 @@ ACTIONS:
   cm-set                 Add/update ConfigMap values
   cm-del                 Delete a ConfigMap key
   restart                Rollout restart a deployment
+  stale                  Pick a deployment, list its stale pods, Tab-select + delete
+
+STALE HEURISTIC (scoped to the picked deployment's selector labels):
+  A pod is flagged stale if any of:
+    - status.reason == Evicted
+    - phase == Failed
+    - phase == Succeeded and not owned by a Job
+    - deletionTimestamp set > 5 min ago (stuck Terminating)
 
 NAVIGATION (interactive mode):
   back-ns, back-cluster, back-sub, quit
@@ -782,6 +946,7 @@ az account show >/dev/null 2>&1 || die "Not logged into Azure CLI. Run: az login
 # Direct subcommand mode: pick sub/cluster/ns once, run the action, exit.
 if [[ -n "${1:-}" ]]; then
   ACTION="$1"
+
   SUB_ID="$(pick_subscription)"
   CLUSTER_INFO="$(pick_aks_cluster "$SUB_ID")"
   CLUSTER_NAME="${CLUSTER_INFO%%|*}"
