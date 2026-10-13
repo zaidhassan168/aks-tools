@@ -15,6 +15,16 @@ kit
 ## Install
 
 ```bash
+brew install zaidhassan168/aks-tools/kit      # install
+brew upgrade zaidhassan168/aks-tools/kit      # update
+kit --version                                 # check
+```
+
+Always use the full name: a plain `brew install kit` can install a different package. Activate your Azure role (for example in PIM) before you use `kit`, because it gets fresh credentials on every run.
+
+Without Homebrew:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/zaidhassan168/aks-tools/main/install.sh | bash
 ```
 

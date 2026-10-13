@@ -32,6 +32,29 @@ What you get in one CLI:
 brew install zaidhassan168/aks-tools/kit
 ```
 
+Always use the full name `zaidhassan168/aks-tools/kit`. A plain `brew install kit` can install a different package.
+
+### Update
+
+```bash
+brew upgrade zaidhassan168/aks-tools/kit
+kit --version
+```
+
+### Switching to Homebrew from an older install
+
+If you installed `kit` with the curl script, `make install` or a manual copy, remove that copy first. Otherwise it can run instead of the Homebrew version.
+
+```bash
+which -a kit                     # lists every kit on your PATH
+rm /usr/local/bin/kit            # or ~/bin/kit: the copy that is not under /opt/homebrew
+brew install zaidhassan168/aks-tools/kit
+```
+
+### Before you use it
+
+`kit` gets fresh cluster credentials on every run. Activate your Azure role (for example in PIM) first, then run `az login` if your session expired.
+
 ### One-line installer (curl)
 
 ```bash
