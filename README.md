@@ -14,12 +14,13 @@ What you get in one CLI:
 
 - **Pods, logs, describe, events** — paged through `less` so you can scroll, select, and copy.
 - **`exec`** — shell into a running pod.
-- **`console`** — spin up a Rails console pod (image, ConfigMap, and node scheduling auto-detected from a real running pod). Pod is **deleted the moment you exit**.
+- **`console`** — spin up a Rails console pod (image, env source — ConfigMap or Key Vault secret — and node scheduling auto-detected from a real running pod). Pod is **deleted the moment you exit**.
 - **ConfigMap** — view full YAML, view data only, set values via `KEY=VALUE` prompts, delete keys.
-- **`restart`** — rollout-restart a picked deployment and watch the rollout.
-- **`cleanup` / `list-orphaned`** — sweep leaked Rails console pods across every cluster you've touched.
+- **Key Vault** — `kv-get` shows the synced values; `kv-set` lets you pick existing keys, change them, and restart the apps that read them.
+- **`restart` / `restart-all`** — rollout-restart one deployment or all of them and watch the rollout.
+- **`cleanup` / `list-orphaned`** — sweep leaked Rails console pods on a cluster.
 
-Each cluster gets its own `kit-<sub>-<cluster>` kube context — dev/stg/prod credentials never overwrite each other.
+`kit` gets fresh credentials on every run and keeps them only in a temp kubeconfig that it deletes on exit.
 
 → Full docs: [`kit/README.md`](./kit/README.md)
 

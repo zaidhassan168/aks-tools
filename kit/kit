@@ -6,6 +6,8 @@
 
 set -euo pipefail
 
+KIT_VERSION="1.3.2"
+
 # ---------- Setup ----------
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
 need kubectl
@@ -19,6 +21,24 @@ CLUSTER_NAME=""
 CLUSTER_RG=""
 NAMESPACE=""
 
+# Non-interactive / agent mode. Flags pre-select sub/cluster/ns/pod/etc so no
+# picker prompts fire. Auto-enabled when stdout is not a TTY (e.g. run by an
+# agent) or KIT_NONINTERACTIVE=1. See show_help NON-INTERACTIVE section.
+OPT_SUB=""; OPT_CLUSTER=""; OPT_NS=""; OPT_POD=""; OPT_DEPLOY=""; OPT_CM=""; OPT_SPC=""
+OPT_TAIL=""; ASSUME_YES=0; OPT_CMD=()
+KV_TMP=""
+# Cluster credentials. By default kit keeps them only in a temp kubeconfig that
+# is deleted on exit. Only an extension file can set KIT_KUBECONFIG to keep them
+# in a fixed file instead (see EXTENSIONS in show_help).
+KIT_USER_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+KIT_KUBECONFIG=""
+KIT_KUBECONFIG_DIR=""
+ORPHAN_USER=""
+KIT_STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/kit"
+NONINTERACTIVE=0
+[[ -t 1 ]] || NONINTERACTIVE=1
+[[ -n "${KIT_NONINTERACTIVE:-}" ]] && NONINTERACTIVE=1
+
 # Console-specific
 KEEP_POD="${KEEP_POD:-0}"
 ATTACH_MODE="${KIT_ATTACH_MODE:-attach}"
@@ -30,9 +50,107 @@ CONSOLE_SUCCESS=0
 die() { echo "Error: $*" >&2; exit 1; }
 has_fzf() { command -v fzf >/dev/null 2>&1; }
 
+# Local extensions: kit sources an optional private shell file at start (see
+# EXTENSIONS in show_help). A hook runs only when the file defines it.
+KIT_EXT_FILE="${KIT_EXTENSIONS:-${XDG_CONFIG_HOME:-$HOME/.config}/kit/extensions.sh}"
+has_hook() { declare -F "$1" >/dev/null 2>&1; }
+
+# Resolve exactly one item from a newline-separated list on stdin by
+# case-insensitive substring match. Prints the match. Dies (listing options)
+# on zero matches; dies on ambiguity when strict=1, else takes the first match.
+# Usage: printf '%s\n' "$list" | resolve_one "<needle>" "<kind>" [strict]
+resolve_one() {
+  local needle="$1" kind="$2" strict="${3:-0}" list matches n
+  list="$(cat)"
+  matches="$(printf '%s\n' "$list" | grep -i -F -- "$needle" || true)"
+  n="$(printf '%s\n' "$matches" | grep -c . || true)"
+  [[ "$n" -eq 0 ]] && die "No $kind matching '$needle'. Available:"$'\n'"$(printf '%s\n' "$list" | sed 's/^/  - /')"
+  if [[ "$strict" == "1" && "$n" -gt 1 ]]; then
+    die "Ambiguous $kind '$needle' ($n matches). Be specific:"$'\n'"$(printf '%s\n' "$matches" | sed 's/^/  - /')"
+  fi
+  printf '%s\n' "$matches" | head -1
+}
+
 # Pager: less so the user can scroll/select/copy. -R raw colours, -X keep on screen
 # after quit, -F auto-quit if output fits one page.
-pager() { less -RXF; }
+pager() { if [[ "$NONINTERACTIVE" == "1" ]]; then cat; else less -RXF; fi; }
+
+# ---------- VPN (macOS, via scutil) ----------
+# Cluster API servers are behind privatelink, so kit brings the VPN up before
+# touching a cluster and tears it down on exit — but only if kit was the one
+# that connected it. A VPN that was already up when kit started is left alone.
+#   KIT_VPN=0             disable VPN handling entirely
+#   KIT_VPN_SERVICE=name  service name from `scutil --nc list`
+#                         (default: first enabled Azure VPN Client service)
+#   KIT_VPN_KEEP=1        leave the VPN up on exit even if kit connected it
+#   KIT_VPN_TIMEOUT=45    seconds to wait for the tunnel to report Connected
+VPN_SERVICE=""
+VPN_STARTED_BY_KIT=0
+
+vpn_enabled() { [[ "${KIT_VPN:-1}" != "0" ]] && command -v scutil >/dev/null 2>&1; }
+
+# Sets VPN_SERVICE (not echoed: must run in the main shell, not a subshell).
+vpn_resolve_service() {
+  [[ -z "$VPN_SERVICE" ]] || return 0
+  if [[ -n "${KIT_VPN_SERVICE:-}" ]]; then
+    VPN_SERVICE="$KIT_VPN_SERVICE"
+  else
+    VPN_SERVICE="$(scutil --nc list 2>/dev/null | grep '^\*' | grep -F 'AzureVpnMac' \
+      | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1 || true)"
+  fi
+}
+
+# First line of `scutil --nc status`: Connected | Connecting | Disconnected | Disconnecting.
+# No `head` in a pipe here: under pipefail scutil's SIGPIPE would poison the result.
+vpn_status() {
+  local out
+  out="$(scutil --nc status "$1" 2>/dev/null || true)"
+  [[ -n "$out" ]] || { echo Unknown; return 0; }
+  printf '%s\n' "${out%%$'\n'*}"
+}
+
+vpn_ensure() {
+  vpn_enabled || return 0
+  local svc st waited=0 timeout="${KIT_VPN_TIMEOUT:-45}"
+  vpn_resolve_service
+  svc="$VPN_SERVICE"
+  [[ -n "$svc" ]] || return 0
+  st="$(vpn_status "$svc")"
+  case "$st" in
+    Connected)
+      echo "VPN: $svc already connected (kit will leave it up on exit)." >&2
+      return 0 ;;
+    Connecting*)
+      echo "VPN: $svc is connecting (started outside kit), waiting..." >&2 ;;
+    *)
+      echo "VPN: connecting $svc..." >&2
+      if ! scutil --nc start "$svc" >/dev/null 2>&1; then
+        echo "VPN: could not start $svc; continuing without it." >&2
+        return 0
+      fi
+      VPN_STARTED_BY_KIT=1 ;;
+  esac
+  while (( waited < timeout )); do
+    st="$(vpn_status "$svc")"
+    if [[ "$st" == Connected ]]; then
+      echo "VPN: connected." >&2
+      return 0
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  echo "VPN: $svc not connected after ${timeout}s (status: $st). Cluster calls may fail." >&2
+}
+
+vpn_cleanup() {
+  [[ "$VPN_STARTED_BY_KIT" -eq 1 ]] || return 0
+  VPN_STARTED_BY_KIT=0
+  if [[ "${KIT_VPN_KEEP:-0}" == "1" ]]; then
+    echo "VPN: KIT_VPN_KEEP=1, leaving $VPN_SERVICE up." >&2
+    return 0
+  fi
+  echo "VPN: disconnecting $VPN_SERVICE..." >&2
+  scutil --nc stop "$VPN_SERVICE" >/dev/null 2>&1 || true
+}
 
 # ---------- Pickers ----------
 
@@ -47,6 +165,17 @@ $(az account list --query "[].{id:id, name:name}" -o tsv 2>/dev/null || true)
 EOF
   ((${#ids[@]})) || die "No Azure subscriptions found. Run: az login"
   if ((${#ids[@]}==1)); then echo "${ids[0]}"; return; fi
+  if [[ -n "$OPT_SUB" ]]; then
+    local hit="" i needle; needle="$(printf '%s' "$OPT_SUB" | tr 'A-Z' 'a-z')"
+    for i in "${!ids[@]}"; do
+      case "$(printf '%s' "${ids[$i]} ${names[$i]}" | tr 'A-Z' 'a-z')" in
+        *"$needle"*) [[ -n "$hit" ]] && die "Ambiguous --sub '$OPT_SUB'. Matches more than one subscription."; hit="${ids[$i]}" ;;
+      esac
+    done
+    [[ -n "$hit" ]] || die "No subscription matching '$OPT_SUB'. Available: ${names[*]}"
+    echo "$hit"; return
+  fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Multiple subscriptions; pass --sub <name|id>"
   if has_fzf; then
     local selected
     selected="$(for i in "${!ids[@]}"; do printf "%s\t%s\n" "${names[$i]}" "${ids[$i]}"; done \
@@ -66,6 +195,10 @@ EOF
 
 pick_aks_cluster() {
   local sub_id="$1"
+  local hit_ext
+  if has_hook kit_ext_pick_cluster && hit_ext="$(kit_ext_pick_cluster "$sub_id" start)" && [[ -n "$hit_ext" ]]; then
+    echo "$hit_ext"; return
+  fi
   echo "Fetching AKS clusters..." >&2
   local err_file; err_file="$(mktemp)"
   local raw; raw="$(az aks list --subscription "$sub_id" --query "[].{name:name, rg:resourceGroup}" -o tsv 2>"$err_file" || true)"
@@ -84,11 +217,24 @@ EOF
       echo "az error: $err" >&2
     else
       echo "Likely cause: Reader role on this subscription is not active." >&2
-      echo "Fix: Azure Portal -> PIM -> activate Reader, then: az account clear && az login" >&2
     fi
-    exit 1
+    if has_hook kit_ext_pick_cluster && hit_ext="$(kit_ext_pick_cluster "$sub_id" denied)" && [[ -n "$hit_ext" ]]; then
+      echo "$hit_ext"; return
+    fi
+    die "Activate your PIM role for this subscription (Azure Portal -> PIM), then run: az account clear && az login"
   fi
   if ((${#c_names[@]}==1)); then echo "${c_names[0]}|${c_rgs[0]}"; return; fi
+  if [[ -n "$OPT_CLUSTER" ]]; then
+    local hit="" i needle; needle="$(printf '%s' "$OPT_CLUSTER" | tr 'A-Z' 'a-z')"
+    for i in "${!c_names[@]}"; do
+      case "$(printf '%s' "${c_names[$i]}" | tr 'A-Z' 'a-z')" in
+        *"$needle"*) [[ -n "$hit" ]] && die "Ambiguous --cluster '$OPT_CLUSTER'."; hit="${c_names[$i]}|${c_rgs[$i]}" ;;
+      esac
+    done
+    [[ -n "$hit" ]] || die "No cluster matching '$OPT_CLUSTER' in subscription $sub_id"
+    echo "$hit"; return
+  fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Multiple clusters; pass --cluster <name>"
   if has_fzf; then
     local selected
     selected="$(for i in "${!c_names[@]}"; do printf "%s\t%s\n" "${c_names[$i]}" "${c_rgs[$i]}"; done \
@@ -108,13 +254,40 @@ EOF
 
 list_ns() { $KUBECTL --context "$KUBE_CTX" get ns -o custom-columns=NAME:.metadata.name --no-headers; }
 
+# The last namespace picked on each kube context, so the picker can offer it first.
+ns_last_get() {
+  awk -F'\t' -v c="$KUBE_CTX" '$1==c {v=$2} END {if (v!="") print v}' "$KIT_STATE_DIR/last-ns" 2>/dev/null || true
+}
+
+ns_last_set() {
+  [[ -n "${1:-}" ]] || return 0
+  mkdir -p "$KIT_STATE_DIR" 2>/dev/null || return 0
+  local f="$KIT_STATE_DIR/last-ns"
+  { awk -F'\t' -v c="$KUBE_CTX" '$1!=c' "$f" 2>/dev/null || true; printf '%s\t%s\n' "$KUBE_CTX" "$1"; } > "$f.tmp" 2>/dev/null \
+    && mv "$f.tmp" "$f" 2>/dev/null || true
+}
+
+list_ns_last_first() {
+  local all last
+  all="$(list_ns)"
+  last="$(ns_last_get)"
+  if [[ -n "$last" ]] && printf '%s\n' "$all" | grep -qxF -- "$last"; then
+    printf '%s\n' "$last"
+    printf '%s\n' "$all" | grep -vxF -- "$last" || true
+  else
+    printf '%s\n' "$all"
+  fi
+}
+
 pick_ns() {
+  if [[ -n "$OPT_NS" ]]; then list_ns | resolve_one "$OPT_NS" "namespace" 0; return; fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Non-interactive: pass --ns <name>"
   if has_fzf; then
-    list_ns | fzf --prompt="Namespace > " --height=40% --reverse
+    list_ns_last_first | fzf --prompt="Namespace > " --header="Last used is first" --height=40% --reverse
   else
     local items=()
     while IFS= read -r line; do [[ -n "$line" ]] && items+=("$line"); done <<EOF
-$(list_ns)
+$(list_ns_last_first)
 EOF
     ((${#items[@]})) || die "No namespaces found."
     echo "Select a namespace:" >&2
@@ -129,6 +302,11 @@ EOF
 
 pick_pod() {
   local ns="$1"
+  if [[ -n "$OPT_POD" ]]; then
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" get pods -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null \
+      | resolve_one "$OPT_POD" "pod" 0; return
+  fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Non-interactive: pass --pod <name-substring> for namespace '$ns'"
   local pods=()
   while IFS= read -r line; do [[ -n "$line" ]] && pods+=("$line"); done <<EOF
 $($KUBECTL --context "$KUBE_CTX" -n "$ns" get pods -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount --no-headers 2>/dev/null || true)
@@ -149,6 +327,11 @@ EOF
 
 pick_configmap() {
   local ns="$1"
+  if [[ -n "$OPT_CM" ]]; then
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" get cm -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null \
+      | grep -v kube-root-ca | resolve_one "$OPT_CM" "configmap" 0; return
+  fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Non-interactive: pass --cm <name-substring> for namespace '$ns'"
   local cms=()
   while IFS= read -r line; do [[ -n "$line" ]] && cms+=("$line"); done <<EOF
 $($KUBECTL --context "$KUBE_CTX" -n "$ns" get cm -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null | grep -v kube-root-ca || true)
@@ -170,6 +353,11 @@ EOF
 
 pick_deployment() {
   local ns="$1"
+  if [[ -n "$OPT_DEPLOY" ]]; then
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" get deploy -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null \
+      | resolve_one "$OPT_DEPLOY" "deployment" 0; return
+  fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Non-interactive: pass --deploy <name-substring> for namespace '$ns'"
   local deploys=()
   while IFS= read -r d; do [[ -n "$d" ]] && deploys+=("$d"); done <<EOF
 $($KUBECTL --context "$KUBE_CTX" -n "$ns" get deploy -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null || true)
@@ -197,11 +385,60 @@ ensure_creds() {
   local err
   if ! err="$(az aks get-credentials \
       --subscription "$sub_id" --resource-group "$rg" --name "$cluster" \
-      --overwrite-existing --context "$ctx" 2>&1 >/dev/null)"; then
+      --overwrite-existing --context "$ctx" --file "$KIT_KUBECONFIG" 2>&1 >/dev/null)"; then
     echo "Error: Failed to get AKS credentials." >&2
     echo "$err" >&2
     exit 1
   fi
+}
+
+# ---------- Kubeconfig ----------
+
+# Uses the extension's fixed kubeconfig when it set one. Otherwise creates a
+# private temp kubeconfig for this run, which kit_exit deletes.
+kubeconfig_setup() {
+  if [[ -z "$KIT_KUBECONFIG" ]]; then
+    KIT_KUBECONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kit.XXXXXX")"
+    chmod 700 "$KIT_KUBECONFIG_DIR"
+    KIT_KUBECONFIG="$KIT_KUBECONFIG_DIR/config"
+  fi
+  export KUBECONFIG="$KIT_KUBECONFIG"
+}
+
+kubeconfig_cleanup() {
+  [[ -n "$KIT_KUBECONFIG_DIR" ]] || return 0
+  rm -f "$KIT_KUBECONFIG_DIR/config" "$KIT_KUBECONFIG_DIR/config.lock"
+  rmdir "$KIT_KUBECONFIG_DIR" 2>/dev/null || true
+  KIT_KUBECONFIG_DIR=""
+}
+
+# Older kit and aksc versions left kit-* / aksc-* contexts in the user's own
+# kubeconfig. Remove them quietly, with their user and cluster entries when no
+# other context still uses those entries.
+forget_old_contexts() {
+  local plan kind name
+  plan="$(KUBECONFIG="$KIT_USER_KUBECONFIG" kubectl config view -o json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ctxs = {c["name"]: (c.get("context") or {}) for c in d.get("contexts") or []}
+old = [n for n in ctxs if n.startswith(("kit-", "aksc-"))]
+if not old:
+    sys.exit(0)
+keep = [c for n, c in ctxs.items() if n not in old]
+for n in old:
+    print("context\t" + n)
+for kind in ("user", "cluster"):
+    used = {c.get(kind) for c in keep}
+    for v in sorted({ctxs[n].get(kind) for n in old} - used - {None}):
+        print(kind + "\t" + v)
+')" || true
+  [[ -n "$plan" ]] || return 0
+  while IFS=$'\t' read -r kind name; do
+    KUBECONFIG="$KIT_USER_KUBECONFIG" kubectl config "delete-$kind" "$name" >/dev/null 2>&1 || true
+  done <<< "$plan"
 }
 
 # ---------- Read commands (paged) ----------
@@ -218,7 +455,7 @@ cmd_logs() {
   local ns="$1"
   local pod; pod="$(pick_pod "$ns")" || return 1
   [[ -n "$pod" ]] || return 1
-  local tail="${2:-200}"
+  local tail="${OPT_TAIL:-${2:-200}}"
   {
     echo "=== Logs for $pod (tail $tail) ==="
     $KUBECTL --context "$KUBE_CTX" -n "$ns" logs "$pod" --tail="$tail" --all-containers=true
@@ -273,10 +510,49 @@ cmd_cm_get() {
 
 # ---------- Mutating commands ----------
 
+# Succeeds when a workload in the namespace reads the ConfigMap (envFrom, env
+# valueFrom or a volume). Also succeeds when kubectl output can't be parsed, so
+# a read failure never blocks an edit.
+cm_in_use() {
+  local ns="$1" cm="$2"
+  $KUBECTL --context "$KUBE_CTX" -n "$ns" get deploy,statefulset,daemonset,cronjob -o json 2>/dev/null | python3 -c '
+import sys, json
+cm = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+def walk(o):
+    if isinstance(o, dict):
+        for k in ("configMapRef", "configMapKeyRef", "configMap"):
+            v = o.get(k)
+            if isinstance(v, dict) and v.get("name") == cm:
+                return True
+        return any(walk(v) for v in o.values())
+    if isinstance(o, list):
+        return any(walk(v) for v in o)
+    return False
+sys.exit(0 if walk(d) else 1)
+' "$cm"
+}
+
+# Returns non-zero when the user backs out of editing an unused ConfigMap.
+cm_confirm_unused() {
+  local ns="$1" cm="$2" confirm
+  cm_in_use "$ns" "$cm" && return 0
+  echo "Warning: no workload in $ns reads ConfigMap $cm, so this edit has no effect on the apps." >&2
+  if $KUBECTL --context "$KUBE_CTX" -n "$ns" get secretproviderclass --no-headers 2>/dev/null | grep -q .; then
+    echo "This namespace reads env from Azure Key Vault. Use 'kit kv-set' instead." >&2
+  fi
+  read -rp "Edit it anyway? (y/n) > " confirm
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]]
+}
+
 cmd_cm_set() {
   local ns="$1"
   local cm; cm="$(pick_configmap "$ns")" || return 1
   [[ -n "$cm" ]] || return 1
+  cm_confirm_unused "$ns" "$cm" || { echo "Cancelled."; return 0; }
   echo "Set configmap values (KEY=VALUE). Empty line to finish."
   local patch_data="{" first=1
   while true; do
@@ -305,6 +581,7 @@ cmd_cm_del() {
   local ns="$1"
   local cm; cm="$(pick_configmap "$ns")" || return 1
   [[ -n "$cm" ]] || return 1
+  cm_confirm_unused "$ns" "$cm" || { echo "Cancelled."; return 0; }
   echo "Current keys in $cm:"
   local keys=()
   while IFS= read -r k; do [[ -n "$k" ]] && keys+=("$k"); done <<EOF
@@ -328,20 +605,360 @@ EOF
   fi
 }
 
+# ---------- Key Vault (Secrets Store CSI) ----------
+# Charts that moved env to Azure Key Vault ship a SecretProviderClass (SPC). Its
+# secretObjects map each Key Vault object to an env key in a K8s secret that the
+# CSI driver keeps in sync. kit reads that live mapping instead of guessing
+# object names, because prefixes and overrides differ per chart.
+
+pick_spc() {
+  local ns="$1" list
+  list="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get secretproviderclass -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null || true)"
+  [[ -n "$list" ]] || die "No SecretProviderClass in $ns. This namespace still reads a ConfigMap: use cm-get/cm-set."
+  if [[ -n "$OPT_SPC" ]]; then printf '%s\n' "$list" | resolve_one "$OPT_SPC" "secretproviderclass" 1; return; fi
+  local items=()
+  while IFS= read -r line; do [[ -n "$line" ]] && items+=("$line"); done <<< "$list"
+  if ((${#items[@]}==1)); then echo "${items[0]}"; return; fi
+  [[ "$NONINTERACTIVE" == "1" ]] && die "Non-interactive: pass --spc <name-substring> for namespace '$ns'"
+  if has_fzf; then
+    printf "%s\n" "${items[@]}" | fzf --prompt="SecretProviderClass > " --height=40% --reverse
+  else
+    echo "Select a SecretProviderClass:" >&2
+    for i in "${!items[@]}"; do printf "%2d) %s\n" "$((i+1))" "${items[$i]}" >&2; done
+    while true; do
+      read -rp "> " n
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#items[@]} )) && { echo "${items[$((n-1))]}"; return; }
+      echo "Invalid selection." >&2
+    done
+  fi
+}
+
+# Line 1: the vault name. Then one line per key: <env key> TAB <kv object> TAB <k8s secret>.
+kv_map() {
+  local ns="$1" spc="$2"
+  $KUBECTL --context "$KUBE_CTX" -n "$ns" get secretproviderclass "$spc" -o json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+spec = d.get("spec") or {}
+vault = (spec.get("parameters") or {}).get("keyvaultName", "")
+rows = []
+for so in spec.get("secretObjects") or []:
+    for item in so.get("data") or []:
+        rows.append("\t".join([item.get("key", ""), item.get("objectName", ""), so.get("secretName", "")]))
+if not vault or not rows:
+    sys.exit(1)
+print(vault)
+print("\n".join(sorted(rows)))
+'
+}
+
+cmd_kv_get() {
+  local ns="$1" spc map vault rows secret
+  spc="$(pick_spc "$ns")" || return 1
+  [[ -n "$spc" ]] || return 1
+  map="$(kv_map "$ns" "$spc")" || die "Could not read the Key Vault mapping from $spc."
+  vault="${map%%$'\n'*}"; rows="${map#*$'\n'}"
+  {
+    echo "=== Key Vault: $vault (SecretProviderClass: $spc) ==="
+    echo "=== Values as synced into the K8s secret the pods read ==="
+    for secret in $(printf '%s\n' "$rows" | cut -f3 | sort -u); do
+      echo "--- secret/$secret"
+      $KUBECTL --context "$KUBE_CTX" -n "$ns" get secret "$secret" -o json 2>/dev/null | python3 -c '
+import sys, json, base64
+secret, rows = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(sys.stdin).get("data") or {}
+except Exception:
+    data = None
+if data is None:
+    print("  (secret not found: no running pod has synced it yet)")
+for line in rows.splitlines():
+    key, obj, sec = line.split("\t")
+    if sec != secret or data is None:
+        continue
+    val = base64.b64decode(data[key]).decode("utf-8", "replace").replace("\n", "\\n") if key in data else "<not synced>"
+    print(key + "=" + val + "    [kv: " + obj + "]")
+' "$secret" "$rows"
+    done
+  } | pager
+}
+
+# Waits until the synced K8s secret holds the new values. Args: lines of
+# <k8s secret> TAB <env key> TAB <sha256 of new value>.
+kv_wait_sync() {
+  local ns="$1" expect="$2" deadline=$(( $(date +%s) + 180 )) secret pending
+  echo "Waiting for the CSI driver to sync the new values (it polls about every 2 minutes)..."
+  while true; do
+    pending=0
+    for secret in $(printf '%s\n' "$expect" | cut -f1 | sort -u); do
+      $KUBECTL --context "$KUBE_CTX" -n "$ns" get secret "$secret" -o json 2>/dev/null | python3 -c '
+import sys, json, base64, hashlib
+secret, expect = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(sys.stdin).get("data") or {}
+except Exception:
+    sys.exit(1)
+for line in expect.splitlines():
+    sec, key, sha = line.split("\t")
+    if sec != secret:
+        continue
+    if key not in data or hashlib.sha256(base64.b64decode(data[key])).hexdigest() != sha:
+        sys.exit(1)
+' "$secret" "$expect" || pending=1
+    done
+    (( pending == 0 )) && { echo "Synced."; return 0; }
+    (( $(date +%s) > deadline )) && { echo "Not synced after 3 minutes. Restarted pods still read Key Vault on mount." >&2; return 1; }
+    sleep 10
+  done
+}
+
+# Rollout-restarts the given deployments, then waits for each rollout.
+restart_deployments() {
+  local ns="$1" d; shift
+  for d in "$@"; do
+    echo "Restarting deployment $d..."
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" rollout restart deployment "$d"
+  done
+  echo "Watching rollout..."
+  for d in "$@"; do
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" rollout status deployment "$d" --timeout=300s || true
+  done
+}
+
+# Rollout-restarts, after one confirmation, every deployment that reads one of the given K8s secrets.
+kv_restart_readers() {
+  local ns="$1" secrets="$2" deploys confirm
+  deploys="$($KUBECTL --context "$KUBE_CTX" -n "$ns" get deploy -o json 2>/dev/null | python3 -c '
+import sys, json
+secrets = set(sys.argv[1].split())
+try:
+    items = json.load(sys.stdin).get("items") or []
+except Exception:
+    items = []
+def reads(o):
+    if isinstance(o, dict):
+        for k in ("secretRef", "secretKeyRef"):
+            v = o.get(k)
+            if isinstance(v, dict) and v.get("name") in secrets:
+                return True
+        return any(reads(v) for v in o.values())
+    if isinstance(o, list):
+        return any(reads(v) for v in o)
+    return False
+for it in items:
+    if reads((it.get("spec") or {}).get("template")):
+        print(it["metadata"]["name"])
+' "$secrets")"
+  if [[ -z "$deploys" ]]; then
+    echo "No deployment in $ns reads $secrets. Nothing to restart." >&2
+    return 0
+  fi
+  echo
+  echo "Env vars are read at pod start. These deployments need a restart to use the new values:"
+  printf '  - %s\n' $deploys
+  echo "CronJobs pick up the new values on their next run."
+  read -rp "Restart them now? (y/n) > " confirm
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "Not restarted. Run 'kit restart-all' later."; return 0; }
+  restart_deployments "$ns" $deploys
+}
+
+# Prints one value from a K8s secret. Fails when the secret or key is missing.
+secret_value() {
+  $KUBECTL --context "$KUBE_CTX" -n "$1" get secret "$2" -o json 2>/dev/null | python3 -c '
+import sys, json, base64
+try:
+    data = json.load(sys.stdin).get("data") or {}
+except Exception:
+    sys.exit(1)
+if sys.argv[1] not in data:
+    sys.exit(1)
+sys.stdout.write(base64.b64decode(data[sys.argv[1]]).decode("utf-8", "replace"))
+' "$3"
+}
+
+# Shortens a value for one-line display.
+short_value() {
+  local v="${1//$'\n'/\\n}"
+  if (( ${#v} > 60 )); then printf '%s... (%d chars)' "${v:0:60}" "${#v}"; else printf '%s' "$v"; fi
+}
+
+# Explains how to add a key that the SPC does not list. Args: spc, vault, rows, [env key].
+kv_new_key_help() {
+  local spc="$1" vault="$2" rows="$3" key="${4:-}" prefix obj
+  prefix="$(printf '%s\n' "$rows" | cut -f2 | python3 -c '
+import sys, os
+names = [l.strip() for l in sys.stdin if l.strip()]
+p = os.path.commonprefix(names)
+print(p[:p.rfind("-") + 1] if "-" in p else "")
+')"
+  obj="${prefix}<key-in-lowercase-with-dashes>"
+  [[ -n "$key" ]] && obj="${prefix}$(printf '%s' "$key" | tr 'A-Z_' 'a-z-')"
+  cat >&2 <<MSG
+  kit only changes keys that already exist in $spc. To add ${key:-a new key}:
+    1. Add the secret '$obj' to Key Vault $vault.
+    2. Add the line '$obj' to the SecretProviderClass template in the app's
+       Helm chart and open a PR. If the env key needs another name, add an
+       override in that template.
+    3. Deploy the app. The new pods then get the key.
+MSG
+}
+
+# Lets the user choose existing keys only. Prints the chosen rows
+# (<env key> TAB <kv object> TAB <k8s secret>). A name that is not in the
+# SPC is reported as missing, with the steps to add it.
+kv_pick_keys() {
+  local spc="$1" vault="$2" rows="$3" out query sel=""
+  if has_fzf; then
+    out="$(printf '%s\n' "$rows" | fzf --multi --print-query --delimiter=$'\t' --with-nth=1 \
+      --prompt="Key > " --header="Existing keys in $spc (Tab = choose more than one)" \
+      --height=60% --reverse || true)"
+    query="${out%%$'\n'*}"
+    [[ "$out" == *$'\n'* ]] && sel="${out#*$'\n'}"
+    if [[ -z "$sel" ]]; then
+      if [[ -n "$query" ]]; then
+        echo "'$query' does not exist in $spc." >&2
+        kv_new_key_help "$spc" "$vault" "$rows" "$query"
+      fi
+      return 1
+    fi
+    printf '%s\n' "$sel"
+    return 0
+  fi
+  local items=() line i n hit answer parts
+  while IFS= read -r line; do [[ -n "$line" ]] && items+=("$line"); done <<< "$rows"
+  echo "Existing keys in $spc:" >&2
+  for i in "${!items[@]}"; do printf "%3d) %s\n" "$((i+1))" "${items[$i]%%$'\t'*}" >&2; done
+  read -rp "Numbers (comma-separated) or a key name > " answer
+  [[ -n "$answer" ]] || return 1
+  IFS=',' read -ra parts <<< "$answer"
+  ((${#parts[@]})) || return 1
+  for n in "${parts[@]}"; do
+    n="$(printf '%s' "$n" | tr -d ' ')"
+    [[ -n "$n" ]] || continue
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#items[@]} )); then
+      sel+="${items[$((n-1))]}"$'\n'
+      continue
+    fi
+    hit="$(printf '%s\n' "$rows" | awk -F'\t' -v k="$n" 'toupper($1)==toupper(k) {print; exit}')"
+    if [[ -n "$hit" ]]; then
+      sel+="$hit"$'\n'
+    else
+      echo "'$n' does not exist in $spc." >&2
+      kv_new_key_help "$spc" "$vault" "$rows" "$n"
+    fi
+  done
+  [[ -n "$sel" ]] || return 1
+  printf '%s' "$sel"
+}
+
+# Updates existing Key Vault values only. A new key also needs the chart's
+# SecretProviderClass list in the app's Helm chart and a deploy, or no pod sees it.
+cmd_kv_set() {
+  local ns="$1"
+  [[ -t 0 ]] || die "kv-set needs a terminal: it asks for the new values."
+  command -v shasum >/dev/null 2>&1 || die "Missing dependency: shasum"
+  local spc map vault rows picked
+  spc="$(pick_spc "$ns")" || return 1
+  [[ -n "$spc" ]] || return 1
+  map="$(kv_map "$ns" "$spc")" || die "Could not read the Key Vault mapping from $spc."
+  vault="${map%%$'\n'*}"; rows="${map#*$'\n'}"
+  echo "Key Vault: $vault (SecretProviderClass: $spc, $(printf '%s\n' "$rows" | grep -c .) keys)"
+  picked="$(kv_pick_keys "$spc" "$vault" "$rows")" || { echo "No key chosen. Nothing changed."; return 0; }
+
+  local keys=() objs=() secs=() curs=() vals=() key obj sec
+  while IFS=$'\t' read -r key obj sec; do
+    [[ -n "$key" ]] || continue
+    keys+=("$key"); objs+=("$obj"); secs+=("$sec")
+  done <<< "$picked"
+  ((${#keys[@]})) || { echo "No key chosen. Nothing changed."; return 0; }
+
+  echo
+  local i cur val chosen=()
+  for i in "${!keys[@]}"; do
+    cur="$(secret_value "$ns" "${secs[$i]}" "${keys[$i]}")" || cur="<not synced>"
+    echo "${keys[$i]} (Key Vault: ${objs[$i]})"
+    echo "  current: $(short_value "$cur")"
+    read -rp "  new value (empty = keep) > " val
+    if [[ -z "$val" || "$val" == "$cur" ]]; then echo "  unchanged."; continue; fi
+    curs+=("$cur"); vals+=("$val"); chosen+=("$i")
+  done
+  ((${#chosen[@]})) || { echo "No values changed. Nothing written."; return 0; }
+
+  echo
+  echo "Will write to Key Vault $vault:"
+  local j
+  for j in "${!chosen[@]}"; do
+    i="${chosen[$j]}"
+    echo "  ${keys[$i]}: $(short_value "${curs[$j]}")  ->  $(short_value "${vals[$j]}")"
+  done
+  local confirm
+  read -rp "Confirm? (y/n) > " confirm
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "Cancelled."; return 0; }
+
+  # Values go through a 0600 temp file, not argv, so they stay out of `ps` and
+  # values that start with '-' are not read as flags.
+  KV_TMP="$(mktemp)"; chmod 600 "$KV_TMP"
+  local expect="" written_secrets="" failed=0 sha
+  for j in "${!chosen[@]}"; do
+    i="${chosen[$j]}"
+    printf '%s' "${vals[$j]}" > "$KV_TMP"
+    if az keyvault secret set --vault-name "$vault" --name "${objs[$i]}" --file "$KV_TMP" --encoding utf-8 --output none; then
+      echo "  set ${keys[$i]}"
+      sha="$(shasum -a 256 "$KV_TMP" | awk '{print $1}')"
+      expect+="${secs[$i]}"$'\t'"${keys[$i]}"$'\t'"$sha"$'\n'
+      written_secrets+="${secs[$i]} "
+    else
+      echo "  FAILED ${keys[$i]}" >&2
+      failed=1
+    fi
+  done
+  rm -f "$KV_TMP"; KV_TMP=""
+  (( failed )) && echo "Some writes failed. Writing needs the 'Key Vault Secrets Officer' role on $vault." >&2
+  [[ -n "$expect" ]] || return 1
+
+  kv_wait_sync "$ns" "${expect%$'\n'}" || true
+  kv_restart_readers "$ns" "$(printf '%s\n' $written_secrets | sort -u | tr '\n' ' ')"
+  return $failed
+}
+
 cmd_restart() {
   local ns="$1"
   local deploy; deploy="$(pick_deployment "$ns")" || return 1
   [[ -n "$deploy" ]] || return 1
-  echo "Restarting deployment $deploy..."
-  $KUBECTL --context "$KUBE_CTX" -n "$ns" rollout restart deployment "$deploy"
-  echo "Watching rollout..."
-  $KUBECTL --context "$KUBE_CTX" -n "$ns" rollout status deployment "$deploy" --timeout=180s || true
+  restart_deployments "$ns" "$deploy"
+}
+
+cmd_restart_all() {
+  local ns="$1" deploys=() d confirm
+  while IFS= read -r d; do [[ -n "$d" ]] && deploys+=("$d"); done <<EOF
+$($KUBECTL --context "$KUBE_CTX" -n "$ns" get deploy -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null || true)
+EOF
+  ((${#deploys[@]})) || die "No deployments found in $ns"
+  echo "Deployments in $ns:"
+  printf '  - %s\n' "${deploys[@]}"
+  if [[ "$NONINTERACTIVE" == "1" ]]; then
+    [[ "$ASSUME_YES" == "1" ]] || die "Non-interactive: pass --yes to restart all ${#deploys[@]} deployments in $ns"
+  else
+    read -rp "Restart all ${#deploys[@]}? (y/n) > " confirm
+    [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "Cancelled."; return 0; }
+  fi
+  restart_deployments "$ns" "${deploys[@]}"
 }
 
 cmd_exec() {
   local ns="$1"
   local pod; pod="$(pick_pod "$ns")" || return 1
   [[ -n "$pod" ]] || return 1
+  # Non-interactive: run a one-shot command and stream its output (no TTY).
+  # Usage: kit exec --ns N --pod P -- <cmd...>
+  if [[ "$NONINTERACTIVE" == "1" ]]; then
+    ((${#OPT_CMD[@]})) || die "Non-interactive exec needs a command: kit exec --ns <ns> --pod <pod> -- <cmd...>"
+    $KUBECTL --context "$KUBE_CTX" -n "$ns" exec -i "$pod" -- "${OPT_CMD[@]}"
+    return $?
+  fi
   echo "Opening shell in $pod (Ctrl+D to exit)..."
   $KUBECTL --context "$KUBE_CTX" -n "$ns" exec -it "$pod" -- /bin/sh -c 'command -v bash >/dev/null && exec bash || exec sh' || true
 }
@@ -361,6 +978,12 @@ console_cleanup() {
   $KUBECTL --context "$CONSOLE_CTX" -n "$CONSOLE_NS" delete pod "$CONSOLE_POD" --wait=false >/dev/null 2>&1 || true
   CONSOLE_POD=""; CONSOLE_NS=""; CONSOLE_CTX=""
 }
+
+# One EXIT trap for the whole run: drop a kv-set temp file, a live console pod,
+# the temp kubeconfig, then the VPN if kit brought it up. All are no-ops when
+# there is nothing to clean.
+kit_exit() { [[ -z "$KV_TMP" ]] || rm -f "$KV_TMP"; console_cleanup; kubeconfig_cleanup; vpn_cleanup; }
+trap kit_exit EXIT
 
 console_print_debug() {
   local ns="$1" pod="$2"
@@ -424,29 +1047,7 @@ EOF
   for i in "${dep_imgs[@]}"; do [[ "$i" == *".azurecr.io/"* ]] && { IMG="$i"; break; }; done
   [[ -z "$IMG" ]] && IMG="${dep_imgs[0]}"
 
-  # Detect ConfigMap
-  local CM=""
-  if $KUBECTL --context "$KUBE_CTX" -n "$ns" get cm "${ns}-config" >/dev/null 2>&1; then
-    CM="${ns}-config"
-  else
-    local cms=()
-    while IFS= read -r line; do [[ -n "$line" ]] && cms+=("$line"); done <<EOF
-$($KUBECTL --context "$KUBE_CTX" -n "$ns" get cm -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null | grep -Ei 'config|env' || true)
-EOF
-    if ((${#cms[@]}==1)); then
-      CM="${cms[0]}"
-    elif ((${#cms[@]}>1)); then
-      if has_fzf; then
-        CM="$(printf "%s\n" "${cms[@]}" | fzf --prompt="ConfigMap > " --height=40% --reverse)"
-      else
-        for i in "${!cms[@]}"; do printf "%2d) %s\n" "$((i+1))" "${cms[$i]}" >&2; done
-        read -rp "> " m
-        [[ "$m" =~ ^[0-9]+$ ]] && (( m>=1 && m<=${#cms[@]} )) && CM="${cms[$((m-1))]}"
-      fi
-    fi
-  fi
-
-  # Copy scheduling from a real Running app pod
+  # Copy scheduling and env sources from a real Running app pod
   local IMG_NO_DIGEST="${IMG%@*}"
   local REPO="${IMG_NO_DIGEST%:*}"
   local REF_POD
@@ -471,6 +1072,52 @@ EOF
   TOLERATIONS_JSON="$(printf '%s' "$REF_JSON" | python3 -c 'import sys,json,json as j; d=json.load(sys.stdin); print(j.dumps(d.get("spec",{}).get("tolerations") or []))')"
   AFFINITY_JSON="$(printf '%s' "$REF_JSON" | python3 -c 'import sys,json,json as j; d=json.load(sys.stdin); print(j.dumps(d.get("spec",{}).get("affinity") or {}))')"
 
+  # Env: reuse the app container's envFrom, so Key Vault charts (secretRef to the
+  # CSI-synced secret) and ConfigMap charts both get the env the app really runs with.
+  local ENVFROM_JSON CM=""
+  ENVFROM_JSON="$(printf '%s' "$REF_JSON" | python3 -c '
+import sys, json
+repo = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+cs = (d.get("spec") or {}).get("containers") or []
+c = next((c for c in cs if repo in (c.get("image") or "")), cs[0] if cs else {})
+print(json.dumps(c.get("envFrom") or []))
+' "$REPO")"
+  if [[ "$ENVFROM_JSON" == "[]" ]]; then
+    if $KUBECTL --context "$KUBE_CTX" -n "$ns" get cm "${ns}-config" >/dev/null 2>&1; then
+      CM="${ns}-config"
+    else
+      local cms=()
+      while IFS= read -r line; do [[ -n "$line" ]] && cms+=("$line"); done <<EOF
+$($KUBECTL --context "$KUBE_CTX" -n "$ns" get cm -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null | grep -Ei 'config|env' || true)
+EOF
+      if ((${#cms[@]}==1)); then
+        CM="${cms[0]}"
+      elif ((${#cms[@]}>1)); then
+        if has_fzf; then
+          CM="$(printf "%s\n" "${cms[@]}" | fzf --prompt="ConfigMap > " --height=40% --reverse)"
+        else
+          for i in "${!cms[@]}"; do printf "%2d) %s\n" "$((i+1))" "${cms[$i]}" >&2; done
+          read -rp "> " m
+          [[ "$m" =~ ^[0-9]+$ ]] && (( m>=1 && m<=${#cms[@]} )) && CM="${cms[$((m-1))]}"
+        fi
+      fi
+    fi
+    [[ -n "$CM" ]] && ENVFROM_JSON="[{\"configMapRef\": {\"name\": \"$CM\"}}]"
+  fi
+  local ENV_DESC
+  ENV_DESC="$(printf '%s' "$ENVFROM_JSON" | python3 -c '
+import sys, json
+out = []
+for e in json.load(sys.stdin):
+    if "secretRef" in e: out.append("secret/" + e["secretRef"].get("name", "?"))
+    if "configMapRef" in e: out.append("configmap/" + e["configMapRef"].get("name", "?"))
+print(", ".join(out) or "<none>")
+')"
+
   local USER_NAME TS POD_NAME
   USER_NAME="$(id -un 2>/dev/null || whoami)"
   TS="$(date +%s)"
@@ -483,21 +1130,10 @@ EOF
     POD_ARGS='["bundle","exec","rails","console"]'
   fi
 
-  local ENVFROM=""
-  if [[ -n "${CM:-}" ]]; then
-    ENVFROM=$(cat <<YML
-      envFrom:
-        - configMapRef:
-            name: $CM
-YML
-)
-  fi
-
-  # Register cleanup before pod creation so trap fires even if apply succeeds and next step fails
+  # Set before pod creation so the global EXIT trap cleans up even if apply succeeds and the next step fails
   CONSOLE_POD="$POD_NAME"
   CONSOLE_NS="$ns"
   CONSOLE_CTX="$KUBE_CTX"
-  trap console_cleanup EXIT
 
   cat <<EOF | $KUBECTL --context "$KUBE_CTX" -n "$ns" apply -f - >/dev/null
 apiVersion: v1
@@ -509,6 +1145,7 @@ metadata:
 spec:
   restartPolicy: Never
   terminationGracePeriodSeconds: 0
+  activeDeadlineSeconds: $(( ${KIT_CONSOLE_MAX_HOURS:-12} * 3600 ))
   serviceAccountName: $SVC_ACCOUNT
   nodeSelector: $NODESELECTOR_JSON
   tolerations: $TOLERATIONS_JSON
@@ -518,7 +1155,7 @@ spec:
       image: $IMG
       command: $POD_COMMAND
       args: $POD_ARGS
-$ENVFROM
+      envFrom: $ENVFROM_JSON
       env:
         - name: NEW_RELIC_AGENT_ENABLED
           value: "false"
@@ -530,7 +1167,7 @@ EOF
   echo "Context:   $KUBE_CTX"
   echo "Namespace: $ns"
   echo "Image:     $IMG"
-  echo "ConfigMap: ${CM:-<none>}"
+  echo "Env from:  $ENV_DESC"
   echo "Ref pod:   $REF_POD"
   echo "Pod:       $POD_NAME"
   echo "Mode:      $mode"
@@ -578,7 +1215,6 @@ EOF
   # Always delete the pod now (don't wait for the EXIT trap so we don't leak
   # pods across multiple console invocations in the same kit session).
   console_cleanup
-  trap - EXIT
   return $rc
 }
 
@@ -846,7 +1482,10 @@ pick_action() {
     "cm-get       — View configmap data"
     "cm-set       — Add/update configmap values"
     "cm-del       — Delete a configmap key"
+    "kv-get       — View Key Vault env values"
+    "kv-set       — Change Key Vault values (pick existing keys)"
     "restart      — Restart a deployment"
+    "restart-all  — Restart every deployment in the namespace"
     "stale        — Pick deployment, list its stale pods, delete selected"
     "back-ns      — Change namespace"
     "back-cluster — Change cluster"
@@ -880,7 +1519,10 @@ run_action() {
     cm-get)       cmd_cm_get "$ns" ;;
     cm-set)       cmd_cm_set "$ns" ;;
     cm-del)       cmd_cm_del "$ns" ;;
+    kv-get)       cmd_kv_get "$ns" ;;
+    kv-set)       cmd_kv_set "$ns" ;;
     restart)      cmd_restart "$ns" ;;
+    restart-all)  cmd_restart_all "$ns" ;;
     stale)        cmd_stale "$ns" ;;
     *)            echo "Unknown action: $action" >&2; return 1 ;;
   esac
@@ -889,15 +1531,42 @@ run_action() {
 # ---------- Help ----------
 
 show_help() {
-  cat <<HELP
+  cat <<'HELP'
 kit — Kubernetes Interactive Toolkit for AKS
 
 USAGE:
   kit                    Interactive mode (pick sub -> cluster -> ns -> action)
   kit <action>           Pick sub/cluster/ns then run action directly
-  kit cleanup [USER]     Delete all orphaned Rails console pods (default: you)
-  kit list-orphaned [USER]  List orphaned Rails console pods
+  kit <action> --sub X --cluster Y --ns Z [...]   Non-interactive (agent) mode
+  kit cleanup [USER]     Pick a cluster, delete its orphaned Rails console pods (default: you)
+  kit list-orphaned [USER]  Pick a cluster, list its orphaned Rails console pods
   kit -h | --help        This help
+  kit --version          Print the kit version
+
+NON-INTERACTIVE (agent) MODE:
+  Pass selection flags to skip every picker. Auto-enabled when stdout is not a
+  TTY (e.g. run by an agent) or with KIT_NONINTERACTIVE=1. Same binary, same
+  actions — interactive mode is unchanged when no flags are given.
+
+  Flags (case-insensitive substring match against the live list):
+    --env <dev|stg|prd>  shortcut for --sub X --cluster X
+    --sub <name|id>      subscription (must match exactly one)
+    --cluster <name>     cluster
+    --ns <name>          namespace
+    --pod <substring>    pod (for logs/describe/exec) — first match
+    --deploy <name>      deployment (for restart)
+    -y, --yes            confirm restart-all in non-interactive mode
+    --cm <name>          configmap (for cm-view/cm-get)
+    --spc <name>         SecretProviderClass (for kv-get, when a namespace has several)
+    --tail <n>           log lines for 'logs'
+    -- <cmd...>          command for headless 'exec' (no TTY)
+
+  Examples:
+    kit pods    --env prd --ns myapp
+    kit logs    --sub dev --cluster dev --ns myapp --pod web --tail 100
+    kit cm-get  --sub prd --cluster prd --ns myapp --cm myapp-config
+    kit exec    --sub prd --cluster prd --ns myapp --pod web -- \
+                curl -s -o /dev/null -w '%{http_code}' localhost:3000/healthz
 
 ACTIONS:
   pods                   List all pods (paged)
@@ -906,12 +1575,18 @@ ACTIONS:
   describe               Describe a pod
   events                 Recent namespace events
   exec                   Open a shell in a running pod
-  console                Spin up a Rails console pod (use KIT_ATTACH_MODE=exec if no prompt)
+  console                Spin up a Rails console pod with the app pod's env source
+                         (ConfigMap or Key Vault secret; KIT_ATTACH_MODE=exec if no prompt)
   cm-view                View ConfigMap as full yaml
   cm-get                 View ConfigMap data only
   cm-set                 Add/update ConfigMap values
   cm-del                 Delete a ConfigMap key
+  kv-get                 View env values that a Key Vault chart syncs into the pods' secret
+  kv-set                 Pick existing keys from a list, enter new values, write them to
+                         Key Vault, wait for the sync, then offer a restart. A new key
+                         needs a PR to the app's Helm chart; kv-set shows the steps.
   restart                Rollout restart a deployment
+  restart-all            Rollout restart every deployment in the namespace
   stale                  Pick a deployment, list its stale pods, Tab-select + delete
 
 STALE HEURISTIC (scoped to the picked deployment's selector labels):
@@ -926,7 +1601,32 @@ NAVIGATION (interactive mode):
 
 ENV:
   KEEP_POD=1             Keep failed Rails console pod for debugging
+  KIT_EXTENSIONS=path    Private extension file (default ~/.config/kit/extensions.sh)
   KIT_ATTACH_MODE=exec   Default to exec mode for console
+  KIT_CONSOLE_MAX_HOURS=12  Kubernetes stops a console pod after this many hours,
+                         even if kit could not delete it (closed laptop, VPN drop)
+  KIT_VPN=0              Don't touch the VPN (default: connect on start,
+                         disconnect on exit only if kit connected it)
+  KIT_VPN_SERVICE=name   VPN service from `scutil --nc list` (default: Azure VPN Client)
+  KIT_VPN_KEEP=1         Leave the VPN up on exit even if kit connected it
+  KIT_VPN_TIMEOUT=45     Seconds to wait for the VPN to connect
+
+CREDENTIALS:
+  kit gets fresh cluster credentials on every run (your PIM role must be
+  active) and keeps them only in a private temp file that it deletes on exit.
+
+EXTENSIONS:
+  If the extension file exists, kit sources it at start. It can set
+  KIT_KUBECONFIG to keep credentials in a fixed kubeconfig file, and define:
+    kit_ext_pick_cluster SUB_ID start|denied
+      Runs before 'az aks list' (start) and when it shows no cluster (denied).
+      Print "<cluster>|<resource group>" or "__context__|<kube context>" and
+      return 0 to choose the cluster; return non-zero to let kit continue.
+
+VPN:
+  On macOS kit checks the Azure VPN before touching a cluster. Already connected:
+  left alone, not disconnected on exit. Disconnected: kit connects it, waits for
+  Connected, and disconnects it again when kit exits (quit, Ctrl-C, or error).
 
 EXAMPLES:
   kit                    # full interactive flow
@@ -936,32 +1636,84 @@ EXAMPLES:
 HELP
 }
 
-# ---------- Main ----------
-
-# Top-level non-cluster commands
-case "${1:-}" in
-  -h|--help|help) show_help; exit 0 ;;
-  cleanup|--cleanup-all|--cleanup) shift; cmd_orphan_clean "${1:-}"; exit 0 ;;
-  list-orphaned|--list-orphaned|--list|-l) shift; cmd_orphan_list "${1:-}"; exit 0 ;;
-esac
-
-az account show >/dev/null 2>&1 || die "Not logged into Azure CLI. Run: az login"
-
-# Direct subcommand mode: pick sub/cluster/ns once, run the action, exit.
-if [[ -n "${1:-}" ]]; then
-  ACTION="$1"
-
-  SUB_ID="$(pick_subscription)"
+# Sets KUBE_CTX for the picked cluster, getting fresh credentials when needed.
+select_cluster() {
   CLUSTER_INFO="$(pick_aks_cluster "$SUB_ID")"
   CLUSTER_NAME="${CLUSTER_INFO%%|*}"
   CLUSTER_RG="${CLUSTER_INFO##*|}"
-  KUBE_CTX="kit-${SUB_ID:0:8}-${CLUSTER_NAME}"
-  ensure_creds "$SUB_ID" "$CLUSTER_RG" "$CLUSTER_NAME" "$KUBE_CTX"
+  if [[ "$CLUSTER_NAME" == "__context__" ]]; then
+    KUBE_CTX="$CLUSTER_RG"
+  else
+    KUBE_CTX="kit-${SUB_ID:0:8}-${CLUSTER_NAME}"
+    ensure_creds "$SUB_ID" "$CLUSTER_RG" "$CLUSTER_NAME" "$KUBE_CTX"
+  fi
+}
+
+# ---------- Main ----------
+
+if [[ -f "$KIT_EXT_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$KIT_EXT_FILE"
+fi
+
+# Top-level commands and legacy aliases
+case "${1:-}" in
+  -h|--help|help) show_help; exit 0 ;;
+  -v|--version|version) echo "kit $KIT_VERSION"; exit 0 ;;
+  --cleanup-all|--cleanup) shift; set -- cleanup ${1+"$@"} ;;
+  --list-orphaned|--list|-l) shift; set -- list-orphaned ${1+"$@"} ;;
+esac
+
+# Parse action + optional non-interactive selection flags (any order).
+# `kit <action> --sub X --cluster Y --ns Z [--pod/--deploy/--cm W] [-- <cmd>]`
+ACTION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env)     shift; OPT_SUB="${1:-}"; OPT_CLUSTER="${1:-}"; [[ -n "$OPT_SUB" ]] || die "--env requires a value"; shift || true ;;
+    --sub)     shift; OPT_SUB="${1:-}";     [[ -n "$OPT_SUB" ]]     || die "--sub requires a value";     shift || true ;;
+    --cluster) shift; OPT_CLUSTER="${1:-}"; [[ -n "$OPT_CLUSTER" ]] || die "--cluster requires a value"; shift || true ;;
+    --ns)      shift; OPT_NS="${1:-}";      [[ -n "$OPT_NS" ]]      || die "--ns requires a value";      shift || true ;;
+    --pod)     shift; OPT_POD="${1:-}";     [[ -n "$OPT_POD" ]]     || die "--pod requires a value";     shift || true ;;
+    --deploy)  shift; OPT_DEPLOY="${1:-}";  [[ -n "$OPT_DEPLOY" ]]  || die "--deploy requires a value";  shift || true ;;
+    --cm)      shift; OPT_CM="${1:-}";      [[ -n "$OPT_CM" ]]      || die "--cm requires a value";      shift || true ;;
+    --spc)     shift; OPT_SPC="${1:-}";     [[ -n "$OPT_SPC" ]]     || die "--spc requires a value";     shift || true ;;
+    --tail)    shift; OPT_TAIL="${1:-}";    [[ -n "$OPT_TAIL" ]]    || die "--tail requires a value";    shift || true ;;
+    -y|--yes)  ASSUME_YES=1; shift ;;
+    --non-interactive) NONINTERACTIVE=1; shift ;;
+    --)        shift; OPT_CMD=("$@"); break ;;
+    -*)        die "Unknown flag: $1 (see kit --help)" ;;
+    *)         if [[ -z "$ACTION" ]]; then ACTION="$1"; shift
+               elif [[ "$ACTION" == "cleanup" || "$ACTION" == "list-orphaned" ]] && [[ -z "$ORPHAN_USER" ]]; then ORPHAN_USER="$1"; shift
+               else die "Unexpected argument: $1"; fi ;;
+  esac
+done
+# Any selection flag implies non-interactive intent even on a TTY.
+[[ -n "$OPT_SUB$OPT_CLUSTER$OPT_NS$OPT_POD$OPT_DEPLOY$OPT_CM$OPT_SPC" ]] && NONINTERACTIVE=1
+
+kubeconfig_setup
+[[ -n "$KIT_KUBECONFIG_DIR" ]] && forget_old_contexts
+
+az account show >/dev/null 2>&1 || die "Not logged into Azure CLI. Run: az login"
+vpn_ensure
+
+# Console pod cleanup. With a temp kubeconfig, pick the cluster first; with a
+# fixed kubeconfig, scan every kit/aksc context in it.
+if [[ "$ACTION" == "cleanup" || "$ACTION" == "list-orphaned" ]]; then
+  if [[ -n "$KIT_KUBECONFIG_DIR" ]]; then
+    SUB_ID="$(pick_subscription)"
+    select_cluster
+  fi
+  if [[ "$ACTION" == "cleanup" ]]; then cmd_orphan_clean "$ORPHAN_USER"; else cmd_orphan_list "$ORPHAN_USER"; fi
+  exit 0
+fi
+
+# Direct subcommand mode: pick sub/cluster/ns once, run the action, exit.
+if [[ -n "$ACTION" ]]; then
+  SUB_ID="$(pick_subscription)"
+  select_cluster
   NAMESPACE="$(pick_ns)"
-  echo
-  echo "Context:   $KUBE_CTX"
-  echo "Namespace: $NAMESPACE"
-  echo
+  ns_last_set "$NAMESPACE"
+  { echo; echo "Context:   $KUBE_CTX"; echo "Namespace: $NAMESPACE"; echo; } >&2
   run_action "$ACTION" "$NAMESPACE"
   exit $?
 fi
@@ -972,15 +1724,12 @@ while true; do  # SUB loop
   SUB_ID="$(pick_subscription)"
 
   while true; do  # CLUSTER loop
-    CLUSTER_INFO="$(pick_aks_cluster "$SUB_ID")"
-    CLUSTER_NAME="${CLUSTER_INFO%%|*}"
-    CLUSTER_RG="${CLUSTER_INFO##*|}"
-    KUBE_CTX="kit-${SUB_ID:0:8}-${CLUSTER_NAME}"
-    ensure_creds "$SUB_ID" "$CLUSTER_RG" "$CLUSTER_NAME" "$KUBE_CTX"
+    select_cluster
 
     nav=""
     while true; do  # NS loop
       NAMESPACE="$(pick_ns)"
+      ns_last_set "$NAMESPACE"
       echo
       echo "Context:   $KUBE_CTX"
       echo "Namespace: $NAMESPACE"
